@@ -1,0 +1,12 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+venv/
+env/
+
+# App-generated data
+uploads/
+chroma_webapp_db/
