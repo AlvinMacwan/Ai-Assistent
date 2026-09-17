@@ -10,3 +10,5 @@ env/
 # App-generated data
 uploads/
 chroma_webapp_db/
+
+instance/

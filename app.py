@@ -1,10 +1,14 @@
 import os
+import hashlib
 import chromadb
 import requests
 from flask import Flask, render_template, request, jsonify
 from sentence_transformers import SentenceTransformer
 from pypdf import PdfReader
 from dotenv import load_dotenv
+from werkzeug.utils import secure_filename
+
+from models import db, User, Message
 
 load_dotenv()  # loads variables from a local .env file into the environment
 
@@ -12,8 +16,21 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 
 app = Flask(__name__)
 
+# --- Database config (Step 1 of V2) ---
+# SECRET_KEY is required by Flask for session signing (Flask-Login will
+# need this once auth is wired in next). Set a real value in your .env —
+# the fallback here is only for local dev convenience.
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-secret-change-this")
+app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///app.db"
+db.init_app(app)
+
+with app.app_context():
+    db.create_all()
+
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+ALLOWED_EXTENSIONS = {".txt", ".pdf"}
 
 # ==========================================
 # RAG pipeline
@@ -35,14 +52,21 @@ def load_text(filepath):
         raise ValueError(f"Unsupported file type: {ext}")
 
 def chunk_text(text, chunk_size=500, overlap=50):
+    # Splits on word boundaries (not raw characters) so chunks never cut
+    # a word in half. chunk_size/overlap are treated as approximate
+    # character counts and converted to a word count using a rough
+    # average of ~6 characters per word (including spaces).
+    words = text.split()
     chunks = []
     start = 0
-    text_length = len(text)
-    while start < text_length:
-        end = start + chunk_size
-        chunk = text[start:end]
-        chunks.append(chunk.strip())
-        start += chunk_size - overlap
+    while start < len(words):
+        end = start + chunk_size // 6
+        chunk_words = words[start:end]
+        if not chunk_words:
+            break
+        chunks.append(" ".join(chunk_words).strip())
+        overlap_words = max(1, overlap // 6)
+        start = end - overlap_words
     return [c for c in chunks if c]
 
 embedder = SentenceTransformer('all-MiniLM-L6-v2')
@@ -53,12 +77,34 @@ collection = client.get_or_create_collection(
 )
 
 def index_file(filepath):
+    """
+    Indexes a file into Chroma. Returns the number of chunks indexed.
+    Returns 0 if the file's content is an exact duplicate of content
+    already indexed under a different filename (nothing new indexed).
+    """
     raw_text = load_text(filepath)
+    filename = os.path.basename(filepath)
+    content_hash = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
+
+    # Skip indexing if this exact content already exists under a
+    # *different* source filename (cheap exact-duplicate guard; does
+    # not catch near-duplicates or paraphrased content — that's a
+    # later, smarter-RAG improvement).
+    existing = collection.get(where={"content_hash": content_hash})
+    if existing["ids"] and not all(
+        meta.get("source") == filename for meta in existing["metadatas"]
+    ):
+        return 0
+
     chunks = chunk_text(raw_text, chunk_size=500, overlap=50)
     embeddings = embedder.encode(chunks).tolist()
-    filename = os.path.basename(filepath)
+
+    # Remove any existing chunks for this filename before re-indexing,
+    # so a shorter re-upload doesn't leave orphaned old chunks behind.
+    collection.delete(where={"source": filename})
+
     ids = [f"{filename}_{i}" for i in range(len(chunks))]
-    metadatas = [{"source": filename} for _ in chunks]
+    metadatas = [{"source": filename, "content_hash": content_hash} for _ in chunks]
 
     collection.upsert(
         ids=ids,
@@ -68,7 +114,7 @@ def index_file(filepath):
     )
     return len(chunks)
 
-def retrieve(query, top_k=3, source_filter=None):
+def retrieve(query, top_k=3, source_filter=None, max_distance=1.0):
     query_embedding = embedder.encode(query).tolist()
 
     query_kwargs = {
@@ -81,7 +127,12 @@ def retrieve(query, top_k=3, source_filter=None):
     results = collection.query(**query_kwargs)
     matched_chunks = results["documents"][0]
     distances = results["distances"][0]
-    return list(zip(distances, matched_chunks))
+
+    # Drop chunks that are too semantically distant to be useful context.
+    # max_distance is a loose starting cutoff for cosine distance — tune
+    # it once you've seen how it behaves on real queries.
+    filtered = [(d, c) for d, c in zip(distances, matched_chunks) if d <= max_distance]
+    return filtered
 
 def generate_answer(query, retrieved_chunks):
     context = "\n\n".join([chunk for distance, chunk in retrieved_chunks])
@@ -129,7 +180,12 @@ def upload():
     if file.filename == "":
         return jsonify({"error": "No file selected"}), 400
 
-    filepath = os.path.join(UPLOAD_FOLDER, file.filename)
+    filename = secure_filename(file.filename)
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        return jsonify({"error": f"Unsupported file type: {ext}"}), 400
+
+    filepath = os.path.join(UPLOAD_FOLDER, filename)
     file.save(filepath)
 
     try:
@@ -137,8 +193,13 @@ def upload():
     except Exception as e:
         return jsonify({"error": f"Failed to index file: {str(e)}"}), 500
 
+    if num_chunks == 0:
+        return jsonify({
+            "message": f"'{filename}' matches content already indexed under another file — skipped."
+        })
+
     return jsonify({
-        "message": f"Indexed '{file.filename}' into {num_chunks} chunks."
+        "message": f"Indexed '{filename}' into {num_chunks} chunks."
     })
 
 @app.route("/documents", methods=["GET"])
@@ -164,7 +225,7 @@ def ask():
     try:
         results = retrieve(query, top_k=3, source_filter=source_filter)
         if not results:
-            return jsonify({"error": "No indexed documents match that filter."}), 400
+            return jsonify({"error": "No indexed documents match that filter, or no results were relevant enough."}), 400
 
         answer = generate_answer(query, results)
     except Exception as e:
