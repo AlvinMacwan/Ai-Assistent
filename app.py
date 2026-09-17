@@ -2,11 +2,14 @@ import os
 import hashlib
 import chromadb
 import requests
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, redirect, url_for, flash
 from sentence_transformers import SentenceTransformer
 from pypdf import PdfReader
 from dotenv import load_dotenv
 from werkzeug.utils import secure_filename
+from flask_login import (
+    LoginManager, login_user, logout_user, login_required, current_user
+)
 
 from models import db, User, Message
 
@@ -26,6 +29,18 @@ db.init_app(app)
 
 with app.app_context():
     db.create_all()
+
+# --- Login setup (Step 2 of V2) ---
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = "login"  # redirect target when @login_required fails
+
+
+@login_manager.user_loader
+def load_user(user_id):
+    # Flask-Login calls this on every request to reload the logged-in
+    # user from the session. Must return None (not raise) if not found.
+    return User.query.get(int(user_id))
 
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -168,10 +183,68 @@ Question: {query}"""
 # Routes
 # ==========================================
 @app.route("/")
+@login_required
 def home():
     return render_template("index.html")
 
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if current_user.is_authenticated:
+        return redirect(url_for("home"))
+
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+
+        if not username or not password:
+            flash("Username and password are required.")
+            return redirect(url_for("register"))
+
+        if User.query.filter_by(username=username).first():
+            flash("That username is already taken.")
+            return redirect(url_for("register"))
+
+        user = User(username=username)
+        user.set_password(password)
+        db.session.add(user)
+        db.session.commit()
+
+        login_user(user)
+        return redirect(url_for("home"))
+
+    return render_template("register.html")
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if current_user.is_authenticated:
+        return redirect(url_for("home"))
+
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+
+        user = User.query.filter_by(username=username).first()
+        if user is None or not user.check_password(password):
+            flash("Invalid username or password.")
+            return redirect(url_for("login"))
+
+        login_user(user)
+        return redirect(url_for("home"))
+
+    return render_template("login.html")
+
+
+@app.route("/logout")
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for("login"))
+
+
 @app.route("/upload", methods=["POST"])
+@login_required
 def upload():
     if "file" not in request.files:
         return jsonify({"error": "No file provided"}), 400
@@ -203,6 +276,7 @@ def upload():
     })
 
 @app.route("/documents", methods=["GET"])
+@login_required
 def list_documents():
     # Chroma has no built-in "distinct values" query, so pull all metadata
     # and de-duplicate in Python. Fine at small/demo scale.
@@ -214,6 +288,7 @@ def list_documents():
     return jsonify({"documents": sorted(sources)})
 
 @app.route("/ask", methods=["POST"])
+@login_required
 def ask():
     data = request.get_json()
     query = data.get("question", "")
