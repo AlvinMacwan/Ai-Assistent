@@ -339,6 +339,30 @@ def list_documents():
             sources.add(meta["source"])
     return jsonify({"documents": sorted(sources)})
 
+@app.route("/documents/<filename>", methods=["DELETE"])
+@login_required
+def delete_document(filename):
+    # secure_filename here guards the same path-traversal risk as on
+    # upload — filename comes from the URL, which is user-controlled.
+    filename = secure_filename(filename)
+
+    # Remove all chunks tagged with this source from the vector database.
+    existing = collection.get(where={"source": filename})
+    if not existing["ids"]:
+        return jsonify({"error": f"No indexed document found named '{filename}'."}), 404
+
+    collection.delete(where={"source": filename})
+
+    # Also remove the physical file from disk, so it doesn't linger and
+    # doesn't get accidentally re-served or re-indexed later. Missing on
+    # disk (e.g. already removed manually) is not treated as a failure —
+    # the important part (removing it from search) already succeeded.
+    filepath = os.path.join(UPLOAD_FOLDER, filename)
+    if os.path.exists(filepath):
+        os.remove(filepath)
+
+    return jsonify({"message": f"Deleted '{filename}' and its indexed chunks."})
+
 @app.route("/ask", methods=["POST"])
 @login_required
 def ask():

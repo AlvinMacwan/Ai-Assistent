@@ -90,6 +90,24 @@
             font-size: 0.9em;
         }
         .topbar a:hover { text-decoration: underline; }
+        .doc-list {
+            margin-top: 12px;
+            font-size: 0.9em;
+        }
+        .doc-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 6px 0;
+            border-bottom: 1px solid #eee;
+        }
+        .doc-row:last-child { border-bottom: none; }
+        .delete-btn {
+            background: #c0392b;
+            padding: 4px 10px;
+            font-size: 0.85em;
+        }
+        .delete-btn:hover { background: #a53125; }
     </style>
 </head>
 <body>
@@ -103,6 +121,8 @@
         <input type="file" id="fileInput">
         <button id="uploadBtn">Upload</button>
         <p class="status" id="uploadStatus"></p>
+
+        <div id="docListContainer"></div>
     </div>
 
     <div class="card">
@@ -125,8 +145,10 @@
         const answerContainer = document.getElementById("answerContainer");
         const chunksContainer = document.getElementById("chunksContainer");
         const sourceSelect = document.getElementById("sourceSelect");
+        const docListContainer = document.getElementById("docListContainer");
 
-        // --- Load the list of indexed documents into the dropdown ---
+        // --- Load the list of indexed documents into the dropdown AND
+        //     into a management list with delete buttons ---
         async function refreshDocumentList() {
             const response = await fetch("/documents");
             const data = await response.json();
@@ -134,12 +156,46 @@
             // Reset dropdown to just the "All documents" option
             sourceSelect.innerHTML = '<option value="">All documents</option>';
 
+            let docListHtml = "";
             data.documents.forEach((doc) => {
                 const option = document.createElement("option");
                 option.value = doc;
                 option.textContent = doc;
                 sourceSelect.appendChild(option);
+
+                docListHtml += `
+                    <div class="doc-row">
+                        <span>${doc}</span>
+                        <button class="delete-btn" data-filename="${doc}">Delete</button>
+                    </div>`;
             });
+
+            docListContainer.innerHTML = data.documents.length
+                ? `<div class="doc-list">${docListHtml}</div>`
+                : '<p class="status">No documents indexed yet.</p>';
+
+            // Wire up each delete button (re-attached every refresh, since
+            // the buttons themselves are freshly rendered each time)
+            document.querySelectorAll(".delete-btn").forEach((btn) => {
+                btn.addEventListener("click", () => deleteDocument(btn.dataset.filename));
+            });
+        }
+
+        async function deleteDocument(filename) {
+            if (!confirm(`Delete '${filename}' and all its indexed chunks?`)) {
+                return;
+            }
+            const response = await fetch(`/documents/${encodeURIComponent(filename)}`, {
+                method: "DELETE",
+            });
+            const data = await response.json();
+
+            if (data.error) {
+                uploadStatus.innerHTML = `<span class="error">${data.error}</span>`;
+            } else {
+                uploadStatus.innerText = data.message;
+                refreshDocumentList();
+            }
         }
 
         // Populate the dropdown once when the page first loads
