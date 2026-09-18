@@ -1,5 +1,6 @@
 import os
 import hashlib
+import json
 import chromadb
 import requests
 from flask import Flask, render_template, request, jsonify, redirect, url_for, flash
@@ -142,19 +143,70 @@ def retrieve(query, top_k=3, source_filter=None, max_distance=1.0):
     results = collection.query(**query_kwargs)
     matched_chunks = results["documents"][0]
     distances = results["distances"][0]
+    metadatas = results["metadatas"][0]  # carries the "source" filename per chunk
 
     # Drop chunks that are too semantically distant to be useful context.
     # max_distance is a loose starting cutoff for cosine distance — tune
     # it once you've seen how it behaves on real queries.
-    filtered = [(d, c) for d, c in zip(distances, matched_chunks) if d <= max_distance]
+    filtered = [
+        (d, c, m.get("source", "unknown"))
+        for d, c, m in zip(distances, matched_chunks, metadatas)
+        if d <= max_distance
+    ]
     return filtered
 
-def generate_answer(query, retrieved_chunks):
-    context = "\n\n".join([chunk for distance, chunk in retrieved_chunks])
+def jsonify_sources(retrieved_chunks):
+    """
+    Serializes retrieved chunks into a JSON string for storage in
+    Message.sources_json. This is NOT Flask's jsonify (which builds an
+    HTTP response) — just Python's json.dumps, packaging the source
+    info so it can be stored as plain text in the database and parsed
+    back out later for display (source citations feature).
+    """
+    return json.dumps([
+        {"distance": round(distance, 4), "text": chunk, "source": source}
+        for distance, chunk, source in retrieved_chunks
+    ])
+
+
+def get_recent_history(conversation_id, limit=6):
+    """
+    Fetches the most recent messages for a conversation, oldest-first,
+    so they can be replayed into the prompt in the order they happened.
+    limit=6 means "last 3 question/answer pairs" (each pair is 2 rows:
+    one 'user' role, one 'assistant' role).
+    """
+    recent = (
+        Message.query
+        .filter_by(conversation_id=conversation_id)
+        .order_by(Message.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return list(reversed(recent))  # flip back to chronological order
+
+
+def generate_answer(query, retrieved_chunks, history=None):
+    context = "\n\n".join([chunk for distance, chunk, source in retrieved_chunks])
+
+    # Turn stored Message rows into plain "Role: text" lines the LLM can
+    # read as prior conversation turns. If there's no history yet (first
+    # message), this section is simply left empty.
+    history_text = ""
+    if history:
+        lines = []
+        for msg in history:
+            role_label = "User" if msg.role == "user" else "Assistant"
+            lines.append(f"{role_label}: {msg.content}")
+        history_text = "\n".join(lines)
+
     prompt = f"""Use the following context to answer the question. If the answer isn't in the context, say you don't know.
 
 Context:
 {context}
+
+Previous conversation:
+{history_text if history_text else "(none yet)"}
 
 Question: {query}"""
 
@@ -297,24 +349,55 @@ def ask():
     if not query:
         return jsonify({"error": "No question provided"}), 400
 
+    # Single ongoing conversation per user, for now (V2 scope) — derived
+    # deterministically from the user's ID rather than stored separately.
+    conversation_id = f"user_{current_user.id}_main"
+
     try:
+        history = get_recent_history(conversation_id)
         results = retrieve(query, top_k=3, source_filter=source_filter)
         if not results:
             return jsonify({"error": "No indexed documents match that filter, or no results were relevant enough."}), 400
 
-        answer = generate_answer(query, results)
+        answer = generate_answer(query, results, history=history)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+    # Persist this turn (both sides) so it's available as history on the
+    # next question in this conversation.
+    user_msg = Message(
+        user_id=current_user.id,
+        conversation_id=conversation_id,
+        role="user",
+        content=query,
+    )
+    assistant_msg = Message(
+        user_id=current_user.id,
+        conversation_id=conversation_id,
+        role="assistant",
+        content=answer,
+        sources_json=jsonify_sources(results),
+    )
+    db.session.add(user_msg)
+    db.session.add(assistant_msg)
+    db.session.commit()
+
     # Return retrieved chunks alongside the answer, for transparency in the UI
     chunks_payload = [
-        {"distance": round(distance, 4), "text": chunk}
-        for distance, chunk in results
+        {"distance": round(distance, 4), "text": chunk, "source": source}
+        for distance, chunk, source in results
     ]
+
+    # A clean, deduplicated list of just the source filenames used —
+    # this is the actual "citation" list (e.g. "Sources: doc1.pdf, doc2.txt"),
+    # separate from chunks_payload which keeps the full text for anyone
+    # who wants to expand and see the exact retrieved passage.
+    cited_sources = sorted(set(source for _, _, source in results))
 
     return jsonify({
         "answer": answer,
         "retrieved_chunks": chunks_payload,
+        "sources": cited_sources,
     })
 
 

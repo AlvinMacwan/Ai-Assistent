@@ -50,6 +50,24 @@
             margin-top: 12px;
             white-space: pre-wrap;
         }
+        .sources-line {
+            font-size: 0.85em;
+            color: #555;
+            margin-top: 8px;
+            padding-left: 4px;
+        }
+        .sources-line .label {
+            font-weight: 600;
+            color: #2b6cb0;
+        }
+        .source-tag {
+            display: inline-block;
+            background: #e2e8f0;
+            border-radius: 4px;
+            padding: 2px 8px;
+            margin-right: 6px;
+            font-family: monospace;
+        }
         .chunk {
             background: #f5f5f5;
             border-left: 3px solid #aaa;
@@ -59,10 +77,26 @@
             color: #444;
         }
         .chunk .score { color: #888; font-family: monospace; }
+        .chunk .chunk-source { color: #2b6cb0; font-weight: 600; font-family: monospace; }
+        .topbar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+        .topbar a {
+            color: #2b6cb0;
+            text-decoration: none;
+            font-size: 0.9em;
+        }
+        .topbar a:hover { text-decoration: underline; }
     </style>
 </head>
 <body>
-    <h1>RAG Demo</h1>
+    <div class="topbar">
+        <h1>RAG Demo</h1>
+        <span>{{ current_user.username }} &middot; <a href="{{ url_for('logout') }}">Logout</a></span>
+    </div>
 
     <div class="card">
         <h2>1. Upload a document</h2>
@@ -167,10 +201,20 @@
 
             answerContainer.innerHTML = `<div class="answer-box">${data.answer}</div>`;
 
+            // Show which document(s) this answer was grounded in, as a
+            // short citation line right under the answer (like a
+            // bibliography, separate from the detailed chunk list below).
+            if (data.sources && data.sources.length > 0) {
+                const tags = data.sources
+                    .map((s) => `<span class="source-tag">📄 ${s}</span>`)
+                    .join("");
+                answerContainer.innerHTML += `<div class="sources-line"><span class="label">Sources:</span> ${tags}</div>`;
+            }
+
             // Render each retrieved chunk so retrieval is visible, not a black box
             let chunksHtml = "<h2>Retrieved chunks</h2>";
             data.retrieved_chunks.forEach((c) => {
-                chunksHtml += `<div class="chunk"><span class="score">${c.distance}</span> | ${c.text}</div>`;
+                chunksHtml += `<div class="chunk"><span class="score">${c.distance}</span> | <span class="chunk-source">${c.source}</span> | ${c.text}</div>`;
             });
             chunksContainer.innerHTML = chunksHtml;
         });
